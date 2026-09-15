@@ -1,9 +1,10 @@
 """
-Notability MCP Server v2.1
+Notability MCP Server v2.2
 Reads Notability PDF auto-backups from Google Drive and exposes them
 as MCP tools for AI assistants.
 
-v2.1: Fixed download method (reverted to simple .execute() with error logging)
+v2.2: Memory-safe - limited text cache (5 entries LRU), skip context download for large files in search
+v2.1: Fixed download method
 v2.0: Drive fullText search, folder context, dedup folders, text cache
 """
 
@@ -11,6 +12,7 @@ import os
 import io
 import json
 import logging
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -27,7 +29,13 @@ DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 USE_LOCAL = bool(BACKUP_DIR)
 
 _drive_service = None
-_text_cache: dict[str, str] = {}
+
+# LRU cache - max 5 notes to stay within 512MB Railway limit
+_CACHE_MAX = 5
+_text_cache: OrderedDict[str, str] = OrderedDict()
+
+# Skip context download for files larger than 2MB in search (saves memory)
+_SEARCH_CONTEXT_MAX_SIZE_KB = 2048
 
 
 def get_drive_service():
@@ -132,11 +140,13 @@ def _drive_fulltext_search(folder_id: str, query: str) -> list[dict]:
     tree_files = _drive_list_files_with_folders(folder_id)
     valid_ids = {f["id"] for f in tree_files}
     valid_id_to_folder = {f["id"]: f.get("_folder", "?") for f in tree_files}
+    valid_id_to_size = {f["id"]: int(f.get("size", 0)) for f in tree_files}
 
     filtered = []
     for match in all_matches:
         if match["id"] in valid_ids:
             match["_folder"] = valid_id_to_folder.get(match["id"], "?")
+            match["_size"] = valid_id_to_size.get(match["id"], 0)
             filtered.append(match)
 
     return filtered
@@ -158,16 +168,35 @@ def _extract_pdf_text(pdf_bytes: bytes, max_chars: int = 50000) -> str:
     return full_text
 
 
-def _get_note_text(file_id: str, file_name: str = "") -> str:
-    """Get extracted text for a note, using cache when available."""
+def _cache_get(file_id: str) -> str | None:
+    """Get text from LRU cache, returning None if not present."""
     if file_id in _text_cache:
+        _text_cache.move_to_end(file_id)
         return _text_cache[file_id]
+    return None
+
+
+def _cache_put(file_id: str, text: str):
+    """Put text in LRU cache, evicting oldest if over limit."""
+    if file_id in _text_cache:
+        _text_cache.move_to_end(file_id)
+    _text_cache[file_id] = text
+    while len(_text_cache) > _CACHE_MAX:
+        evicted_key, _ = _text_cache.popitem(last=False)
+        logger.info(f"Cache evicted {evicted_key} (cache size limit {_CACHE_MAX})")
+
+
+def _get_note_text(file_id: str, file_name: str = "") -> str:
+    """Get extracted text for a note, using LRU cache when available."""
+    cached = _cache_get(file_id)
+    if cached is not None:
+        return cached
 
     try:
         pdf_bytes = _drive_download_file(file_id)
         logger.info(f"Downloaded {file_name or file_id}: {len(pdf_bytes)} bytes")
         text = _extract_pdf_text(pdf_bytes)
-        _text_cache[file_id] = text
+        _cache_put(file_id, text)
         return text
     except Exception as e:
         logger.warning(f"Failed to download/extract {file_name or file_id}: {e}")
@@ -179,7 +208,6 @@ def list_folders() -> str:
     """List all Notability folders from backups."""
     try:
         if USE_LOCAL:
-            import glob as globmod
             folders = set()
             for root, _, files in os.walk(BACKUP_DIR):
                 if any(f.endswith(".pdf") for f in files):
@@ -275,6 +303,7 @@ def search_notes(query: str, max_results: int = 10) -> str:
 
     Uses Google Drive's server-side full-text search first (fast, zero downloads).
     Falls back to downloading and extracting text for notes that Drive hasn't indexed.
+    Context snippets are only downloaded for files under 2MB to preserve memory.
 
     Args:
         query: The keyword or phrase to search for.
@@ -291,19 +320,24 @@ def search_notes(query: str, max_results: int = 10) -> str:
             name = match.get("name", "?")
             note_folder = match.get("_folder", "?")
             file_id = match.get("id", "")
+            file_size_kb = match.get("_size", 0) / 1024
 
-            text = _get_note_text(file_id, name)
-            if text:
-                query_lower = query.lower()
-                text_lower = text.lower()
-                idx = text_lower.find(query_lower)
-                if idx >= 0:
-                    context = text[max(0, idx - 100):idx + len(query) + 200].replace("\n", " ").strip()
-                    results.append(f"{name} [{note_folder}]\n  ...{context}...")
+            # Only download for context if file is small enough (memory safety)
+            if file_size_kb <= _SEARCH_CONTEXT_MAX_SIZE_KB:
+                text = _get_note_text(file_id, name)
+                if text:
+                    query_lower = query.lower()
+                    text_lower = text.lower()
+                    idx = text_lower.find(query_lower)
+                    if idx >= 0:
+                        context = text[max(0, idx - 100):idx + len(query) + 200].replace("\n", " ").strip()
+                        results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  ...{context}...")
+                    else:
+                        results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  (matched by Google Drive OCR - content not extractable as text)")
                 else:
-                    results.append(f"{name} [{note_folder}]\n  (matched by Google Drive OCR - content not extractable as text)")
+                    results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  (matched by Google Drive OCR - download failed)")
             else:
-                results.append(f"{name} [{note_folder}]\n  (matched by Google Drive OCR - could not download for context)")
+                results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  (matched by Google Drive OCR - file too large for context download)")
 
             if len(results) >= max_results:
                 break
@@ -312,7 +346,9 @@ def search_notes(query: str, max_results: int = 10) -> str:
             return f"Found {len(results)} match(es) via Google Drive search:\n\n" + "\n\n".join(results)
 
         # --- Phase 2: Fallback - download and search with pypdf ---
-        logger.info(f"Drive fullText found no matches for '{query}', falling back to pypdf extraction")
+        # Only reaches here if Drive's fullText found nothing (e.g. handwritten notes)
+        # Use the small files only to avoid OOM
+        logger.info(f"Drive fullText found no matches for '{query}', falling back to pypdf extraction (small files only)")
         all_notes = _drive_list_files_with_folders(backup_id)
         query_lower = query.lower()
 
@@ -322,6 +358,11 @@ def search_notes(query: str, max_results: int = 10) -> str:
             file_id = note.get("id", "")
             name = note.get("name", "?")
             note_folder = note.get("_folder", "?")
+            file_size_kb = int(note.get("size", 0)) / 1024
+
+            # Skip large files in fallback to prevent OOM
+            if file_size_kb > _SEARCH_CONTEXT_MAX_SIZE_KB:
+                continue
 
             text = _get_note_text(file_id, name)
             if not text:
@@ -330,7 +371,7 @@ def search_notes(query: str, max_results: int = 10) -> str:
             if query_lower in text.lower():
                 idx = text.lower().find(query_lower)
                 context = text[max(0, idx - 100):idx + len(query) + 200].replace("\n", " ").strip()
-                results.append(f"{name} [{note_folder}]\n  ...{context}...")
+                results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  ...{context}...")
 
         if results:
             return f"Found {len(results)} match(es) via text extraction:\n\n" + "\n\n".join(results)
@@ -341,5 +382,5 @@ def search_notes(query: str, max_results: int = 10) -> str:
 
 
 if __name__ == "__main__":
-    logger.info("Starting Notability MCP Server v2.1")
+    logger.info(f"Starting Notability MCP Server v2.2 (cache limit: {_CACHE_MAX} notes, search context max: {_SEARCH_CONTEXT_MAX_SIZE_KB} KB)")
     mcp.run(transport="http", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
