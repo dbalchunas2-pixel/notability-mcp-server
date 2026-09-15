@@ -1,17 +1,19 @@
 """
-Notability MCP Server v2.2
+Notability MCP Server v2.3
 Reads Notability PDF auto-backups from Google Drive and exposes them
 as MCP tools for AI assistants.
 
-v2.2: Memory-safe - limited text cache (5 entries LRU), skip context download for large files in search
+v2.3: Download retry (3 attempts), surface real errors, search returns Drive matches without downloading
+v2.2: Memory-safe LRU cache, size-limited search context
 v2.1: Fixed download method
-v2.0: Drive fullText search, folder context, dedup folders, text cache
+v2.0: Drive fullText search, folder context, dedup folders
 """
 
 import os
 import io
 import json
 import logging
+import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -29,13 +31,10 @@ DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 USE_LOCAL = bool(BACKUP_DIR)
 
 _drive_service = None
-
-# LRU cache - max 5 notes to stay within 512MB Railway limit
 _CACHE_MAX = 5
 _text_cache: OrderedDict[str, str] = OrderedDict()
-
-# Skip context download for files larger than 2MB in search (saves memory)
-_SEARCH_CONTEXT_MAX_SIZE_KB = 2048
+_DOWNLOAD_RETRIES = 3
+_DOWNLOAD_RETRY_DELAY = 2  # seconds
 
 
 def get_drive_service():
@@ -106,9 +105,19 @@ def _drive_list_files_with_folders(folder_id: str) -> list[dict]:
 
 
 def _drive_download_file(file_id: str) -> bytes:
-    """Download a file from Drive."""
+    """Download a file from Drive with retry logic."""
     service = get_drive_service()
-    return service.files().get_media(fileId=file_id).execute()
+    last_error = None
+    for attempt in range(_DOWNLOAD_RETRIES):
+        try:
+            result = service.files().get_media(fileId=file_id).execute()
+            return result
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Download attempt {attempt + 1}/{_DOWNLOAD_RETRIES} failed for {file_id}: {e}")
+            if attempt < _DOWNLOAD_RETRIES - 1:
+                time.sleep(_DOWNLOAD_RETRY_DELAY)
+    raise last_error
 
 
 def _drive_get_subfolders(folder_id: str) -> list[dict]:
@@ -168,8 +177,7 @@ def _extract_pdf_text(pdf_bytes: bytes, max_chars: int = 50000) -> str:
     return full_text
 
 
-def _cache_get(file_id: str) -> str | None:
-    """Get text from LRU cache, returning None if not present."""
+def _cache_get(file_id: str):
     if file_id in _text_cache:
         _text_cache.move_to_end(file_id)
         return _text_cache[file_id]
@@ -177,17 +185,16 @@ def _cache_get(file_id: str) -> str | None:
 
 
 def _cache_put(file_id: str, text: str):
-    """Put text in LRU cache, evicting oldest if over limit."""
     if file_id in _text_cache:
         _text_cache.move_to_end(file_id)
     _text_cache[file_id] = text
     while len(_text_cache) > _CACHE_MAX:
         evicted_key, _ = _text_cache.popitem(last=False)
-        logger.info(f"Cache evicted {evicted_key} (cache size limit {_CACHE_MAX})")
+        logger.info(f"Cache evicted {evicted_key} (limit {_CACHE_MAX})")
 
 
 def _get_note_text(file_id: str, file_name: str = "") -> str:
-    """Get extracted text for a note, using LRU cache when available."""
+    """Get extracted text for a note, using LRU cache, with retry on download."""
     cached = _cache_get(file_id)
     if cached is not None:
         return cached
@@ -199,7 +206,7 @@ def _get_note_text(file_id: str, file_name: str = "") -> str:
         _cache_put(file_id, text)
         return text
     except Exception as e:
-        logger.warning(f"Failed to download/extract {file_name or file_id}: {e}")
+        logger.warning(f"Failed to download/extract {file_name or file_id} after {_DOWNLOAD_RETRIES} attempts: {e}")
         return ""
 
 
@@ -292,7 +299,9 @@ def read_note(note_path: str) -> str:
             text = _extract_pdf_text(pdf_bytes)
         else:
             text = _get_note_text(note_path)
-        return text if text.strip() else "Note appears to be empty or handwritten (no extractable text)."
+        if text.strip():
+            return text
+        return "Note appears to be empty or handwritten (no extractable text). If this is unexpected, the download may have failed - check server logs."
     except Exception as e:
         return f"Error: {e}"
 
@@ -301,9 +310,9 @@ def read_note(note_path: str) -> str:
 def search_notes(query: str, max_results: int = 10) -> str:
     """Search across all Notability notes for a keyword or phrase.
 
-    Uses Google Drive's server-side full-text search first (fast, zero downloads).
-    Falls back to downloading and extracting text for notes that Drive hasn't indexed.
-    Context snippets are only downloaded for files under 2MB to preserve memory.
+    Uses Google Drive's server-side full-text search - fast, zero downloads.
+    Returns matching file names, folders, and sizes. Use read_note with the file ID
+    to get full text content of any match.
 
     Args:
         query: The keyword or phrase to search for.
@@ -311,76 +320,40 @@ def search_notes(query: str, max_results: int = 10) -> str:
     """
     try:
         backup_id = resolve_backup_folder_id()
-
-        # --- Phase 1: Drive fullText search (fast, server-side) ---
         drive_matches = _drive_fulltext_search(backup_id, query)
-        results = []
 
-        for match in drive_matches:
+        if not drive_matches:
+            # Fallback: search filenames only
+            logger.info(f"Drive fullText found no matches for '{query}', trying filename search")
+            all_notes = _drive_list_files_with_folders(backup_id)
+            query_lower = query.lower()
+            drive_matches = [
+                {"name": n.get("name", "?"), "_folder": n.get("_folder", "?"),
+                 "id": n.get("id", ""), "_size": int(n.get("size", 0))}
+                for n in all_notes if query_lower in n.get("name", "").lower()
+            ]
+
+        if not drive_matches:
+            return f"No matches for '{query}'."
+
+        results = []
+        for match in drive_matches[:max_results]:
             name = match.get("name", "?")
             note_folder = match.get("_folder", "?")
             file_id = match.get("id", "")
-            file_size_kb = match.get("_size", 0) / 1024
+            file_size_kb = round(match.get("_size", 0) / 1024, 1)
+            results.append(f"{name} [{note_folder}] ({file_size_kb} KB)\n  file_id: {file_id}")
 
-            # Only download for context if file is small enough (memory safety)
-            if file_size_kb <= _SEARCH_CONTEXT_MAX_SIZE_KB:
-                text = _get_note_text(file_id, name)
-                if text:
-                    query_lower = query.lower()
-                    text_lower = text.lower()
-                    idx = text_lower.find(query_lower)
-                    if idx >= 0:
-                        context = text[max(0, idx - 100):idx + len(query) + 200].replace("\n", " ").strip()
-                        results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  ...{context}...")
-                    else:
-                        results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  (matched by Google Drive OCR - content not extractable as text)")
-                else:
-                    results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  (matched by Google Drive OCR - download failed)")
-            else:
-                results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  (matched by Google Drive OCR - file too large for context download)")
-
-            if len(results) >= max_results:
-                break
-
-        if results:
-            return f"Found {len(results)} match(es) via Google Drive search:\n\n" + "\n\n".join(results)
-
-        # --- Phase 2: Fallback - download and search with pypdf ---
-        # Only reaches here if Drive's fullText found nothing (e.g. handwritten notes)
-        # Use the small files only to avoid OOM
-        logger.info(f"Drive fullText found no matches for '{query}', falling back to pypdf extraction (small files only)")
-        all_notes = _drive_list_files_with_folders(backup_id)
-        query_lower = query.lower()
-
-        for note in all_notes:
-            if len(results) >= max_results:
-                break
-            file_id = note.get("id", "")
-            name = note.get("name", "?")
-            note_folder = note.get("_folder", "?")
-            file_size_kb = int(note.get("size", 0)) / 1024
-
-            # Skip large files in fallback to prevent OOM
-            if file_size_kb > _SEARCH_CONTEXT_MAX_SIZE_KB:
-                continue
-
-            text = _get_note_text(file_id, name)
-            if not text:
-                continue
-
-            if query_lower in text.lower():
-                idx = text.lower().find(query_lower)
-                context = text[max(0, idx - 100):idx + len(query) + 200].replace("\n", " ").strip()
-                results.append(f"{name} [{note_folder}] ({round(file_size_kb)} KB)\n  ...{context}...")
-
-        if results:
-            return f"Found {len(results)} match(es) via text extraction:\n\n" + "\n\n".join(results)
-        return f"No matches for '{query}'."
+        header = f"Found {len(results)} match(es) via Google Drive search"
+        if len(drive_matches) > max_results:
+            header += f" (showing {max_results} of {len(drive_matches)})"
+        header += ":\n\nUse read_note with the file_id to get full text.\n\n"
+        return header + "\n\n".join(results)
 
     except Exception as e:
         return f"Error: {e}"
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting Notability MCP Server v2.2 (cache limit: {_CACHE_MAX} notes, search context max: {_SEARCH_CONTEXT_MAX_SIZE_KB} KB)")
+    logger.info(f"Starting Notability MCP Server v2.3 (cache: {_CACHE_MAX}, retries: {_DOWNLOAD_RETRIES})")
     mcp.run(transport="http", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
