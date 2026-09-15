@@ -1,25 +1,18 @@
 """
-Notability MCP Server v2.0
+Notability MCP Server v2.1
 Reads Notability PDF auto-backups from Google Drive and exposes them
 as MCP tools for AI assistants.
 
-Key fixes in v2.0:
-- search_notes uses Google Drive's built-in fullText search (zero downloads)
-  with pypdf fallback only for unindexed/handwritten notes
-- list_notes shows folder context for each file
-- list_folders deduplicates folder names
-- In-memory text cache to avoid re-downloading on repeat searches
-- Per-file download error handling with timeouts
+v2.1: Fixed download method (reverted to simple .execute() with error logging)
+v2.0: Drive fullText search, folder context, dedup folders, text cache
 """
 
 import os
 import io
 import json
 import logging
-import hashlib
 from datetime import datetime
 from pathlib import Path
-from functools import lru_cache
 
 from fastmcp import FastMCP
 
@@ -34,8 +27,7 @@ DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 USE_LOCAL = bool(BACKUP_DIR)
 
 _drive_service = None
-_text_cache: dict[str, str] = {}  # file_id -> extracted text
-_folder_cache: dict[str, str] = {}  # file_id -> folder name
+_text_cache: dict[str, str] = {}
 
 
 def get_drive_service():
@@ -45,7 +37,6 @@ def get_drive_service():
 
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
 
     scopes = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -100,23 +91,16 @@ def _drive_list_files_with_folders(folder_id: str) -> list[dict]:
                     all_files.append(item)
             token = results.get("nextPageToken")
             if not token:
-                               break
+                break
 
     _list_in_parent(folder_id, "(root)")
     return all_files
 
 
-def _drive_download_file(file_id: str, timeout: int = 30) -> bytes:
-    """Download a file from Drive with timeout handling."""
+def _drive_download_file(file_id: str) -> bytes:
+    """Download a file from Drive."""
     service = get_drive_service()
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    fh.seek(0)
-    return fh.read()
+    return service.files().get_media(fileId=file_id).execute()
 
 
 def _drive_get_subfolders(folder_id: str) -> list[dict]:
@@ -129,12 +113,8 @@ def _drive_get_subfolders(folder_id: str) -> list[dict]:
 
 
 def _drive_fulltext_search(folder_id: str, query: str) -> list[dict]:
-    """Use Google Drive's built-in full-text search to find PDFs containing query.
-    This searches server-side - zero downloads needed.
-    Only searches direct children recursively via the folder traversal."""
+    """Use Google Drive's built-in full-text search to find PDFs containing query."""
     service = get_drive_service()
-    # Drive fullText search doesn't support recursive parent filtering well,
-    # so we search all non-trashed PDFs and then filter to those in our folder tree
     all_matches = []
     token = None
     escaped_query = query.replace("'", "\\'")
@@ -149,7 +129,6 @@ def _drive_fulltext_search(folder_id: str, query: str) -> list[dict]:
         if not token:
             break
 
-    # Build a set of valid file IDs that belong to our Notability backup tree
     tree_files = _drive_list_files_with_folders(folder_id)
     valid_ids = {f["id"] for f in tree_files}
     valid_id_to_folder = {f["id"]: f.get("_folder", "?") for f in tree_files}
@@ -186,6 +165,7 @@ def _get_note_text(file_id: str, file_name: str = "") -> str:
 
     try:
         pdf_bytes = _drive_download_file(file_id)
+        logger.info(f"Downloaded {file_name or file_id}: {len(pdf_bytes)} bytes")
         text = _extract_pdf_text(pdf_bytes)
         _text_cache[file_id] = text
         return text
@@ -199,6 +179,7 @@ def list_folders() -> str:
     """List all Notability folders from backups."""
     try:
         if USE_LOCAL:
+            import glob as globmod
             folders = set()
             for root, _, files in os.walk(BACKUP_DIR):
                 if any(f.endswith(".pdf") for f in files):
@@ -207,7 +188,6 @@ def list_folders() -> str:
         else:
             folder_id = resolve_backup_folder_id()
             subfolders = _drive_get_subfolders(folder_id)
-            # Deduplicate by name, preserving first occurrence
             seen = set()
             folders = []
             for f in subfolders:
@@ -228,9 +208,10 @@ def list_notes(folder: str = "") -> str:
     """
     try:
         if USE_LOCAL:
+            import glob as globmod
             search_path = os.path.join(BACKUP_DIR, folder) if folder else BACKUP_DIR
             notes = []
-            for filepath in glob.glob(os.path.join(search_path, "**/*.pdf"), recursive=True):
+            for filepath in globmod.glob(os.path.join(search_path, "**/*.pdf"), recursive=True):
                 name = Path(filepath).stem
                 rel = os.path.relpath(filepath, BACKUP_DIR)
                 size_kb = round(os.path.getsize(filepath) / 1024, 1)
@@ -241,11 +222,9 @@ def list_notes(folder: str = "") -> str:
             backup_id = resolve_backup_folder_id()
             if folder:
                 subfolders = _drive_get_subfolders(folder_id=backup_id)
-                # Find matching subfolder(s) by name
                 targets = [f for f in subfolders if f["name"] == folder]
                 if not targets:
                     return f"Folder '{folder}' not found."
-                # List PDFs in all matching subfolders
                 all_notes = []
                 for target in targets:
                     notes = _drive_list_files_with_folders(target["id"])
@@ -295,8 +274,7 @@ def search_notes(query: str, max_results: int = 10) -> str:
     """Search across all Notability notes for a keyword or phrase.
 
     Uses Google Drive's server-side full-text search first (fast, zero downloads).
-    Falls back to downloading and extracting text for notes that Drive hasn't indexed
-    (e.g. handwritten notes).
+    Falls back to downloading and extracting text for notes that Drive hasn't indexed.
 
     Args:
         query: The keyword or phrase to search for.
@@ -314,7 +292,6 @@ def search_notes(query: str, max_results: int = 10) -> str:
             note_folder = match.get("_folder", "?")
             file_id = match.get("id", "")
 
-            # Try to get a text snippet from cache or download
             text = _get_note_text(file_id, name)
             if text:
                 query_lower = query.lower()
@@ -324,7 +301,6 @@ def search_notes(query: str, max_results: int = 10) -> str:
                     context = text[max(0, idx - 100):idx + len(query) + 200].replace("\n", " ").strip()
                     results.append(f"{name} [{note_folder}]\n  ...{context}...")
                 else:
-                    # Drive found it but pypdf didn't - likely image-based
                     results.append(f"{name} [{note_folder}]\n  (matched by Google Drive OCR - content not extractable as text)")
             else:
                 results.append(f"{name} [{note_folder}]\n  (matched by Google Drive OCR - could not download for context)")
@@ -336,7 +312,6 @@ def search_notes(query: str, max_results: int = 10) -> str:
             return f"Found {len(results)} match(es) via Google Drive search:\n\n" + "\n\n".join(results)
 
         # --- Phase 2: Fallback - download and search with pypdf ---
-        # Only reaches here if Drive's fullText found nothing (e.g. handwritten notes)
         logger.info(f"Drive fullText found no matches for '{query}', falling back to pypdf extraction")
         all_notes = _drive_list_files_with_folders(backup_id)
         query_lower = query.lower()
@@ -366,5 +341,5 @@ def search_notes(query: str, max_results: int = 10) -> str:
 
 
 if __name__ == "__main__":
-    logger.info("Starting Notability MCP Server v2.0")
+    logger.info("Starting Notability MCP Server v2.1")
     mcp.run(transport="http", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
